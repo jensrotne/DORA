@@ -1,7 +1,7 @@
 import dagster as dg
 import requests
 
-@dg.asset(required_resource_keys={"pg", "github_token"})
+@dg.asset(required_resource_keys={"pg", "github_token", "github_org"})
 def github_repos(context):
     github_token = context.resources.github_token
     pg = context.resources.pg
@@ -107,3 +107,21 @@ def github_repos(context):
 
     # Return the collected repos for downstream use or testing
     return repos
+
+@dg.asset_check(asset="github_repos", required_resource_keys={"pg"})
+def check_github_repos(context):
+    pg = context.resources.pg
+    
+    count = 0
+    
+    with pg.connect() as conn:
+        result = conn.execute("SELECT COUNT(*) FROM github_repos")
+        count = result.fetchone()[0]
+        if count == 0:
+            return dg.AssetCheckResult(
+              passed=False, metadata={"reason": "No repositories found in github_repos table"}
+            )
+    
+    return dg.AssetCheckResult(
+        passed=True, metadata={"repo_count": count}
+    )
