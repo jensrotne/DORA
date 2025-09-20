@@ -5,22 +5,86 @@ from dagster_duckdb import DuckDBResource
 import requests
 
 from dora.defs.circleci.ops import create_table, get_workflows, make_batches
+from dora.defs.circleci.utils import make_circleci_item_request
 from dora.defs.resources import PostgresResource
+
+
+@dg.asset(
+    deps=["github_repos"],
+    required_resource_keys={"pg", "circleci_token"}
+)
+def circleci_projects(context):
+    pg = context.resources.pg
+    circleci_token = context.resources.circleci_token
+
+    with pg.connect() as conn:
+        repos = conn.execute("SELECT full_name FROM github_repos").fetchall()
+        repo_names = [r[0] for r in repos]
+
+    if len(repo_names) == 0:
+        raise ValueError(
+            "No GitHub repositories found. Skipping CircleCI project fetch.")
+
+    with pg.connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS circleci_projects (
+                id TEXT PRIMARY KEY,
+                slug TEXT,
+                name TEXT,
+                organization_name TEXT,
+                organization_slug TEXT,
+                organization_id TEXT,
+                vcs_url TEXT,
+                provider TEXT,
+                default_branch TEXT
+            )
+        """)
+
+        for repo_name in repo_names:
+            project = make_circleci_item_request(
+                f'https://circleci.com/api/v2/project/gh/{repo_name}',
+                circleci_token,
+                None
+            )
+
+            if not project:
+                continue
+
+            insert_sql = """
+                INSERT INTO circleci_projects (
+                    id, slug, name, organization_name, organization_slug, organization_id,
+                    vcs_url, provider, default_branch
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    slug = circleci_projects.slug,
+                    name = circleci_projects.name,
+                    organization_name = circleci_projects.organization_name,
+                    organization_slug = circleci_projects.organization_slug,
+                    organization_id = circleci_projects.organization_id,
+                    vcs_url = circleci_projects.vcs_url,
+                    provider = circleci_projects.provider,
+                    default_branch = circleci_projects.default_branch
+            """
+
+            conn.execute(insert_sql, (
+                project.get("id"),
+                project.get("slug"),
+                project.get("name"),
+                project.get("organization_name"),
+                project.get("organization_slug"),
+                project.get("organization_id"),
+                project.get("vcs_info").get("vcs_url"),
+                project.get("vcs_info").get("provider"),
+                project.get("vcs_info").get("default_branch")
+            ))
+
 
 @dg.asset(
     deps=["circleci_projects"],
-    required_resource_keys={"pg", "circleci_token"}
+    required_resource_keys={"pg"}
 )
 def circleci_pipelines(context):
-    circleci_token = context.resources.circleci_token
     pg = context.resources.pg
-
-    if not circleci_token:
-        raise ValueError("CIRCLECI_TOKEN environment variable is not set")
-
-    headers = {
-        "Circle-Token": circleci_token
-    }
 
     project_slugs = []
 
@@ -44,7 +108,7 @@ def circleci_pipelines(context):
         while True:
             if page_token:
                 params["page-token"] = page_token
-            
+
             response = requests.get(
                 f"https://circleci.com/api/v2/project/{slug}/pipeline",
                 headers=headers,
@@ -103,12 +167,14 @@ def circleci_pipelines(context):
                 conn.execute(insert_sql, r)
     return pipelines
 
+
 @dg.graph
 def fetch_and_store_workflows(pipeline_ids: List[str]) -> None:
     batches = make_batches(pipeline_ids)
     batches.map(get_workflows)
-    
+
     return None
+
 
 @dg.asset(
     deps=["circleci_pipelines"],
@@ -130,11 +196,10 @@ def circleci_workflows():
                 stopped_at TIMESTAMP
             )
         """)
-    
+
     pipeline_ids = get_pipelines()
 
     return fetch_and_store_workflows(pipeline_ids)
-
 
 
 @dg.asset(
@@ -208,7 +273,7 @@ def circleci_jobs(pg: dg.ResourceParam[PostgresResource]):
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (id) DO NOTHING
         """
-        
+
         rows = []
         for job in jobs:
             rows.append((

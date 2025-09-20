@@ -4,18 +4,23 @@ import requests
 
 from dora.defs.resources import PostgresResource
 
+
+
+
 @dg.op(required_resource_keys={"pg"})
 def get_pipelines(context: dg.OpExecutionContext):
     pg: PostgresResource = context.resources.pg
     with pg.connect() as conn:
         result = conn.execute("SELECT id FROM circleci_pipelines").fetchall()
     return [r[0] for r in result]
-  
+
+
 @dg.op(required_resource_keys={"pg"})
 def create_table(context: dg.OpExecutionContext, create_sql: str):
     pg: PostgresResource = context.resources.pg
     with pg.connect() as conn:
         conn.execute(create_sql)
+
 
 @dg.op(out=dg.DynamicOut())
 def make_batches(pipeline_ids: List[str], num_splits: int = 10):
@@ -26,11 +31,12 @@ def make_batches(pipeline_ids: List[str], num_splits: int = 10):
             continue
         yield dg.DynamicOutput(batch, mapping_key=f"batch_{i}")
 
+
 @dg.op(required_resource_keys={"pg", "circleci_token"})
 def get_workflows(context: dg.OpExecutionContext, pipeline_ids: list[str]) -> None:
     circleci_token = context.resources.circleci_token
     pg: PostgresResource = context.resources.pg
-  
+
     workflows = []
     next_page_token = None
     params = {}
@@ -39,25 +45,24 @@ def get_workflows(context: dg.OpExecutionContext, pipeline_ids: list[str]) -> No
         "Circle-Token": circleci_token
     }
 
-
     for pipeline_id in pipeline_ids:
-         next_page_token = None
-         params = {}
-         while True:
-             if next_page_token:
-                 params["page-token"] = next_page_token
-             response = requests.get(
-                 f"https://circleci.com/api/v2/pipeline/{pipeline_id}/workflow",
-                 headers=headers,
-                 params=params
-             )
-             if response.status_code == 200:
-                 data = response.json()
-                 page_workflows = data.get("items", [])
-                 workflows.extend(page_workflows)
-                 next_page_token = data.get("next_page_token")
-                 if not next_page_token:
-                     break
+        next_page_token = None
+        params = {}
+        while True:
+            if next_page_token:
+                params["page-token"] = next_page_token
+            response = requests.get(
+                f"https://circleci.com/api/v2/pipeline/{pipeline_id}/workflow",
+                headers=headers,
+                params=params
+            )
+            if response.status_code == 200:
+                data = response.json()
+                page_workflows = data.get("items", [])
+                workflows.extend(page_workflows)
+                next_page_token = data.get("next_page_token")
+                if not next_page_token:
+                    break
 
     with pg.connect() as conn:
         insert_sql = """
