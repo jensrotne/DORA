@@ -18,7 +18,8 @@ def circleci_projects(context):
     circleci_token = context.resources.circleci_token
 
     with pg.connect() as conn:
-        repos = conn.execute("SELECT full_name FROM github_repos").fetchall()
+        repos = conn.execute(
+            "SELECT full_name FROM github_repos WHERE archived = false").fetchall()
         repo_names = [r[0] for r in repos]
 
     if len(repo_names) == 0:
@@ -77,6 +78,23 @@ def circleci_projects(context):
                 project.get("vcs_info").get("provider"),
                 project.get("vcs_info").get("default_branch")
             ))
+
+
+@dg.asset_check(asset="circleci_projects", required_resource_keys={"pg"})
+def check_circleci_projects(context):
+    pg = context.resources.pg
+
+    count = 0
+
+    with pg.connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM circleci_projects").fetchone()[0]
+        if count == 0:
+            return dg.AssetCheckResult(
+                passed=False, metadata={"reason": "No projects found in circleci_projects table"}
+            )
+
+    return dg.AssetCheckResult(passed=True, metadata={"project_count": count})
 
 
 @dg.asset(
