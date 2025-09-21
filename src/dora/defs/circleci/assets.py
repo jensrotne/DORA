@@ -195,6 +195,23 @@ def circleci_pipelines(context):
                 for r in rows:
                     conn.execute(insert_sql, r)
 
+@dg.asset_check(asset="circleci_pipelines", required_resource_keys={"pg"})
+def check_circleci_pipelines(context):
+    pg = context.resources.pg
+
+    count = 0
+
+    with pg.connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM circleci_pipelines").fetchone()[0]
+        if count == 0:
+            return dg.AssetCheckResult(
+                passed=False, metadata={"reason": "No pipelines found in circleci_pipelines table"}
+            )
+
+    return dg.AssetCheckResult(passed=True, metadata={"pipeline_count": count})
+
+
 @dg.graph
 def fetch_and_store_workflows(pipeline_ids: List[str]) -> None:
     batches = make_batches(pipeline_ids)
