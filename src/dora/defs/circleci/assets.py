@@ -1,11 +1,9 @@
-import os
 from typing import List
 import dagster as dg
-from dagster_duckdb import DuckDBResource
 import requests
 
 from dora.defs.circleci.ops import create_table, get_workflows, make_batches
-from dora.defs.circleci.utils import make_circleci_item_request
+from dora.defs.circleci.utils import make_circleci_item_request, make_circleci_items_request
 from dora.defs.resources import PostgresResource
 
 
@@ -99,10 +97,11 @@ def check_circleci_projects(context):
 
 @dg.asset(
     deps=["circleci_projects"],
-    required_resource_keys={"pg"}
+    required_resource_keys={"pg", "circleci_token"}
 )
 def circleci_pipelines(context):
     pg = context.resources.pg
+    circleci_token = context.resources.circleci_token
 
     project_slugs = []
 
@@ -110,40 +109,7 @@ def circleci_pipelines(context):
         circleci_projects = conn.execute(
             "SELECT slug FROM circleci_projects").fetchall()
         project_slugs = [r[0] for r in circleci_projects]
-
-    if len(project_slugs) == 0:
-        raise ValueError(
-            "No CircleCI projects found. Skipping pipeline fetch.")
-
-    pipelines = []
-    page_token = None
-
-    params = {}
-
-    for slug in project_slugs:
-        page_token = None
-        params = {}
-        while True:
-            if page_token:
-                params["page-token"] = page_token
-
-            response = requests.get(
-                f"https://circleci.com/api/v2/project/{slug}/pipeline",
-                headers=headers,
-                params=params
-            )
-            if response.status_code == 200:
-                data = response.json()
-                page_pipelines = data.get("items", [])
-                pipelines.extend(page_pipelines)
-                page_token = data.get("next_page_token")
-                if not page_token:
-                    break
-            else:
-                raise ValueError(
-                    f"Error fetching pipelines for {slug}: {response.status_code} - {response.text}")
-
-    with pg.connect() as conn:
+        
         conn.execute("""
             CREATE TABLE IF NOT EXISTS circleci_pipelines (
                 id TEXT PRIMARY KEY,
@@ -153,38 +119,81 @@ def circleci_pipelines(context):
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP,
                 trigger_type TEXT,
-                branch TEXT
+                vcs_provider_name TEXT,
+                vcs_target_repository_url TEXT,
+                vcs_branch TEXT,
+                vcs_review_id TEXT,
+                vcs_review_url TEXT,
+                vcs_revision TEXT,
+                vcs_tag TEXT,
+                vcs_commit_subject TEXT,
+                vcs_commit_body TEXT,
+                vcs_origin_repository_url TEXT
             )
         """)
 
-        insert_sql = """
-            INSERT INTO circleci_pipelines (
-                id, project_slug, number, state, created_at, updated_at,
-                trigger_type, branch
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (id) DO NOTHING
-        """
+    if len(project_slugs) == 0:
+        raise ValueError(
+            "No CircleCI projects found. Skipping pipeline fetch.")
 
-        rows = []
-        for pipeline in pipelines:
-            actor = pipeline.get("trigger", {}).get("actor", {})
-            rows.append((
-                pipeline.get("id"),
-                pipeline.get("project_slug"),
-                pipeline.get("number"),
-                pipeline.get("state"),
-                pipeline.get("created_at"),
-                pipeline.get("updated_at"),
-                pipeline.get("trigger", {}).get("type"),
-                pipeline.get("vcs", {}).get("branch")
-            ))
-        try:
-            conn.executemany(insert_sql, rows)
-        except Exception:
-            for r in rows:
-                conn.execute(insert_sql, r)
-    return pipelines
+    for slug in project_slugs:
+        items = make_circleci_items_request(
+            f'https://circleci.com/api/v2/project/{slug}/pipeline',
+            circleci_token, None)
+        
+        with pg.connect() as conn:
+            insert_sql = """
+                INSERT INTO circleci_pipelines (
+                    id, project_slug, number, state, created_at, updated_at,
+                    trigger_type, vcs_provider_name, vcs_target_repository_url,
+                    vcs_branch, vcs_review_id, vcs_review_url, vcs_revision,
+                    vcs_tag, vcs_commit_subject, vcs_commit_body, vcs_origin_repository_url
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    project_slug = circleci_pipelines.project_slug,
+                    number = circleci_pipelines.number,
+                    state = circleci_pipelines.state,
+                    created_at = circleci_pipelines.created_at,
+                    updated_at = circleci_pipelines.updated_at,
+                    trigger_type = circleci_pipelines.trigger_type,
+                    vcs_provider_name = circleci_pipelines.vcs_provider_name,
+                    vcs_target_repository_url = circleci_pipelines.vcs_target_repository_url,
+                    vcs_branch = circleci_pipelines.vcs_branch,
+                    vcs_review_id = circleci_pipelines.vcs_review_id,
+                    vcs_review_url = circleci_pipelines.vcs_review_url,
+                    vcs_revision = circleci_pipelines.vcs_revision,
+                    vcs_tag = circleci_pipelines.vcs_tag,
+                    vcs_commit_subject = circleci_pipelines.vcs_commit_subject,
+                    vcs_commit_body = circleci_pipelines.vcs_commit_body,
+                    vcs_origin_repository_url = circleci_pipelines.vcs_origin_repository_url
+            """
 
+            rows = []
+            for pipeline in items:
+                rows.append((
+                    pipeline.get("id"),
+                    pipeline.get("project_slug"),
+                    pipeline.get("number"),
+                    pipeline.get("state"),
+                    pipeline.get("created_at"),
+                    pipeline.get("updated_at"),
+                    pipeline.get("trigger", {}).get("type"),
+                    pipeline.get("vcs", {}).get("provider_name"),
+                    pipeline.get("vcs", {}).get("target_repository_url"),
+                    pipeline.get("vcs", {}).get("branch"),
+                    pipeline.get("vcs", {}).get("review_id"),
+                    pipeline.get("vcs", {}).get("review_url"),
+                    pipeline.get("vcs", {}).get("revision"),
+                    pipeline.get("vcs", {}).get("tag"),
+                    pipeline.get("vcs", {}).get("commit", {}).get("subject"),
+                    pipeline.get("vcs", {}).get("commit", {}).get("body"),
+                    pipeline.get("vcs", {}).get("origin_repository_url"),
+                ))
+            try:
+                conn.executemany(insert_sql, rows)
+            except Exception:
+                for r in rows:
+                    conn.execute(insert_sql, r)
 
 @dg.graph
 def fetch_and_store_workflows(pipeline_ids: List[str]) -> None:
